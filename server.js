@@ -1,6 +1,6 @@
-import express from 'express';
-import cors from 'cors';
-import axios from 'axios';
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -37,49 +37,49 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  console.log('Received order with runs:', runs);
+  console.log('Received runs:', runs);
 
-  // Schedule each run
   runs.forEach((run, index) => {
     const runTime = new Date(run.time).getTime();
     const now = Date.now();
     const delay = runTime - now;
 
     if (delay < 0) {
-      console.log(`Run ${index + 1} skipped (time already passed)`);
+      console.log(`Run ${index + 1} skipped (past time)`);
       return;
     }
 
     console.log(`Scheduling run ${index + 1} in ${delay} ms`);
 
     setTimeout(async () => {
-  try {
-    console.log(`Executing run ${index + 1}:`, run);
+      try {
+        console.log(`Executing run ${index + 1}`, run);
 
-    const result = await placeOrder({
-      apiUrl,
-      apiKey,
-      service,
-      link,
-      quantity: run.quantity,
-    });
+        const result = await placeOrder({
+          apiUrl,
+          apiKey,
+          service,
+          link,
+          quantity: run.quantity,
+        });
 
-    if (result?.order) {
-      console.log(`Run ${index + 1} SUCCESS, Order ID:`, result.order);
-    } else if (result?.error) {
-      console.error(`Run ${index + 1} FAILED:`, result.error);
-    } else {
-      console.error(`Run ${index + 1} UNKNOWN RESPONSE:`, result);
-    }
+        if (result?.order) {
+          console.log(`Run ${index + 1} SUCCESS:`, result.order);
+        } else if (result?.error) {
+          console.error(`Run ${index + 1} FAILED:`, result.error);
+        } else {
+          console.error(`Run ${index + 1} UNKNOWN:`, result);
+        }
 
-  } catch (err) {
-    console.error(`Run ${index + 1} ERROR:`, err.response?.data || err.message);
-  }
-}, delay);
+      } catch (err) {
+        console.error(`Run ${index + 1} ERROR:`, err.response?.data || err.message);
+      }
+    }, delay);
+  });
 
   return res.json({
     success: true,
-    message: 'Order scheduled successfully',
+    message: 'Order scheduled',
   });
 });
 
