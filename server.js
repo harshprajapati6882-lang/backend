@@ -53,23 +53,29 @@ app.post('/api/order', async (req, res) => {
     console.log(`Scheduling run ${index + 1} in ${delay} ms`);
 
     setTimeout(async () => {
-      try {
-        console.log(`Executing run ${index + 1}:`, run);
+  try {
+    console.log(`Executing run ${index + 1}:`, run);
 
-        const result = await placeOrder({
-          apiUrl,
-          apiKey,
-          service,
-          link,
-          quantity: run.quantity,
-        });
+    const result = await placeOrder({
+      apiUrl,
+      apiKey,
+      service,
+      link,
+      quantity: run.quantity,
+    });
 
-        console.log(`Run ${index + 1} success:`, result);
-      } catch (err) {
-        console.error(`Run ${index + 1} failed:`, err.response?.data || err.message);
-      }
-    }, delay);
-  });
+    if (result?.order) {
+      console.log(`Run ${index + 1} SUCCESS, Order ID:`, result.order);
+    } else if (result?.error) {
+      console.error(`Run ${index + 1} FAILED:`, result.error);
+    } else {
+      console.error(`Run ${index + 1} UNKNOWN RESPONSE:`, result);
+    }
+
+  } catch (err) {
+    console.error(`Run ${index + 1} ERROR:`, err.response?.data || err.message);
+  }
+}, delay);
 
   return res.json({
     success: true,
