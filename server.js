@@ -1,9 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import axios from 'axios';
-import dotenv from 'dotenv';
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -12,119 +9,104 @@ app.use(cors());
 app.use(express.json());
 
 /* =========================
-   CREATE ORDER
+   HELPER: PLACE ORDER
 ========================= */
-app.post('/api/order', async (req, res) => {
-  const { apiUrl, apiKey, service, link, quantity } = req.body;
-
-  const resolvedApiKey = apiKey || process.env.SMM_API_KEY;
-
-  console.log('[POST /api/order] Incoming payload:', {
-    apiUrl,
-    service,
-    link,
-    quantity,
-    hasApiKey: Boolean(resolvedApiKey),
+async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
+  const params = new URLSearchParams({
+    key: apiKey,
+    action: 'add',
+    service: String(service),
+    link: String(link),
+    quantity: String(quantity),
   });
 
-  if (!apiUrl || !resolvedApiKey || !service || !link || !quantity) {
-    return res.status(400).json({ error: 'Missing required fields.' });
+  const response = await axios.post(apiUrl, params.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+
+  return response.data;
+}
+
+/* =========================
+   CREATE SCHEDULED ORDER
+========================= */
+app.post('/api/order', async (req, res) => {
+  const { apiUrl, apiKey, service, link, runs } = req.body;
+
+  if (!apiUrl || !apiKey || !service || !link || !runs?.length) {
+    return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  try {
-    const params = new URLSearchParams({
-      key: resolvedApiKey,
-      action: 'add',
-      service: String(service),
-      link: String(link),
-      quantity: String(quantity),
-    });
+  console.log('Received order with runs:', runs);
 
-    const panelResponse = await axios.post(apiUrl, params.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      timeout: 15000,
-    });
+  // Schedule each run
+  runs.forEach((run, index) => {
+    const runTime = new Date(run.time).getTime();
+    const now = Date.now();
+    const delay = runTime - now;
 
-    console.log('[POST /api/order] Panel response:', panelResponse.data);
-
-    if (panelResponse.data?.order) {
-      return res.json({ order: panelResponse.data.order });
+    if (delay < 0) {
+      console.log(`Run ${index + 1} skipped (time already passed)`);
+      return;
     }
 
-    if (panelResponse.data?.error) {
-      return res.status(400).json({ error: panelResponse.data.error });
-    }
+    console.log(`Scheduling run ${index + 1} in ${delay} ms`);
 
-    return res.status(400).json({ error: 'Unexpected response from SMM panel.' });
-  } catch (error) {
-    console.error('[POST /api/order] Error:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message,
-    });
+    setTimeout(async () => {
+      try {
+        console.log(`Executing run ${index + 1}:`, run);
 
-    return res.status(500).json({
-      error:
-        error.response?.data?.error ||
-        error.message ||
-        'Failed to create order.',
-    });
-  }
+        const result = await placeOrder({
+          apiUrl,
+          apiKey,
+          service,
+          link,
+          quantity: run.quantity,
+        });
+
+        console.log(`Run ${index + 1} success:`, result);
+      } catch (err) {
+        console.error(`Run ${index + 1} failed:`, err.response?.data || err.message);
+      }
+    }, delay);
+  });
+
+  return res.json({
+    success: true,
+    message: 'Order scheduled successfully',
+  });
 });
 
 /* =========================
-   FETCH SERVICES (FIXED)
+   FETCH SERVICES
 ========================= */
 app.post('/api/services', async (req, res) => {
   const { apiUrl, apiKey } = req.body;
 
-  const resolvedApiKey = apiKey || process.env.SMM_API_KEY;
-
-  console.log('[POST /api/services] Incoming:', {
-    apiUrl,
-    hasApiKey: Boolean(resolvedApiKey),
-  });
-
-  if (!apiUrl || !resolvedApiKey) {
-    return res.status(400).json({ error: 'Missing API URL or API key' });
+  if (!apiUrl || !apiKey) {
+    return res.status(400).json({ error: 'Missing API URL or key' });
   }
 
   try {
     const params = new URLSearchParams({
-      key: resolvedApiKey,
+      key: apiKey,
       action: 'services',
     });
 
     const response = await axios.post(apiUrl, params.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      timeout: 15000,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
-
-    console.log('[POST /api/services] Panel response:', response.data);
 
     return res.json(response.data);
   } catch (error) {
-    console.error('[POST /api/services] Error:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message,
-    });
-
     return res.status(500).json({
-      error:
-        error.response?.data?.error ||
-        error.message ||
-        'Failed to fetch services',
+      error: error.response?.data || error.message,
     });
   }
 });
 
 /* =========================
-   SERVER START
+   START SERVER
 ========================= */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
