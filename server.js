@@ -88,7 +88,7 @@ async function processRunsByTime(order) {
     // VIEWS
     if (
       services.views?.runs[i] &&
-      services.views.runs[i].quantity > 0 &&
+      Number(services.views.runs[i].quantity) > 0 &&
       !services.views.runs[i].done
     ) {
       await placeAndMark(services.views.runs[i], {
@@ -102,7 +102,7 @@ async function processRunsByTime(order) {
     // LIKES
     if (
       services.likes?.runs[i] &&
-      services.likes.runs[i].quantity > 0 &&
+      Number(services.likes.runs[i].quantity) > 0 &&
       !services.likes.runs[i].done
     ) {
       await placeAndMark(services.likes.runs[i], {
@@ -113,10 +113,10 @@ async function processRunsByTime(order) {
       }, 'LIKES');
     }
 
-    // SHARES (minimum 20)
+    // SHARES (STRICT minimum 20)
     if (
       services.shares?.runs[i] &&
-      services.shares.runs[i].quantity >= 20 &&
+      Number(services.shares.runs[i].quantity) >= 20 &&
       !services.shares.runs[i].done
     ) {
       await placeAndMark(services.shares.runs[i], {
@@ -125,13 +125,15 @@ async function processRunsByTime(order) {
         service: services.shares.serviceId,
         link
       }, 'SHARES');
+    } else if (services.shares?.runs[i]) {
+      console.log(`SHARES SKIPPED (below 20):`, services.shares.runs[i].quantity);
     }
 
     // SAVES (skip first run)
     if (
       i !== 0 &&
       services.saves?.runs[i] &&
-      services.saves.runs[i].quantity > 0 &&
+      Number(services.saves.runs[i].quantity) > 0 &&
       !services.saves.runs[i].done
     ) {
       await placeAndMark(services.saves.runs[i], {
@@ -146,7 +148,6 @@ async function processRunsByTime(order) {
 
     console.log(`===== RUN ${i + 1} DONE =====`);
 
-    // WAIT BETWEEN RUNS
     await new Promise(resolve => setTimeout(resolve, 60000));
   }
 }
