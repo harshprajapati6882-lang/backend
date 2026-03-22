@@ -37,9 +37,12 @@ function scheduleRun(run, config, label, index) {
   const delay = runTime - now;
 
   if (delay <= 0) {
-    console.log(`[${label}] Run ${index + 1} skipped (past time)`);
-    return;
-  }
+     console.log("Run time passed → executing immediately");
+     
+     // run instantly
+     executeRun();
+     return;
+   }
 
   console.log(`[${label}] Scheduling run ${index + 1} in ${delay} ms`);
 
