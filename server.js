@@ -165,6 +165,12 @@ app.post('/api/services', async (req, res) => {
 /* =========================
    START SERVER
 ========================= */
+setInterval(async () => {
+  try {
+    await axios.get("https://backend-y30y.onrender.com");
+    console.log("Self-ping to keep server alive");
+  } catch (e) {}
+}, 5 * 60 * 1000); // every 5 minutes
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
