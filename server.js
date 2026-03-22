@@ -28,13 +28,13 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   PROCESS RUNS (WITH DELAY)
+   PROCESS RUNS (PER SERVICE)
 ========================= */
-async function processRunsSequentially(runs, config) {
+async function processRuns(runs, config, label) {
   for (let i = 0; i < runs.length; i++) {
     const run = runs[i];
 
-    console.log(`Executing run ${i + 1}`, run);
+    console.log(`[${label}] Run ${i + 1}`, run);
 
     try {
       const result = await placeOrder({
@@ -45,53 +45,77 @@ async function processRunsSequentially(runs, config) {
         quantity: run.quantity,
       });
 
-      // ✅ PROPER RESPONSE HANDLING
       if (result?.order) {
-        console.log(`Run ${i + 1} SUCCESS:`, result.order);
-
+        console.log(`[${label}] SUCCESS:`, result.order);
       } else if (result?.error) {
-        console.error(`Run ${i + 1} FAILED:`, result.error);
-
+        console.error(`[${label}] FAILED:`, result.error);
       } else if (result?.status === 'fail') {
-        console.error(`Run ${i + 1} FAILED:`, result.message);
-
+        console.error(`[${label}] FAILED:`, result.message);
       } else {
-        console.error(`Run ${i + 1} UNKNOWN RESPONSE:`, result);
+        console.error(`[${label}] UNKNOWN:`, result);
       }
 
     } catch (err) {
-      console.error(`Run ${i + 1} ERROR:`, err.response?.data || err.message);
+      console.error(`[${label}] ERROR:`, err.response?.data || err.message);
     }
 
-    // 🔥 IMPORTANT: wait before next run (prevents panel blocking)
-    console.log(`Waiting 60 seconds before next run...`);
+    // wait before next run
     await new Promise(resolve => setTimeout(resolve, 60000));
   }
 }
 
 /* =========================
-   CREATE ORDER (SCHEDULER)
+   CREATE ORDER (MULTI SERVICE)
 ========================= */
 app.post('/api/order', async (req, res) => {
-  const { apiUrl, apiKey, service, link, runs } = req.body;
+  const { apiUrl, apiKey, link, services } = req.body;
 
-  if (!apiUrl || !apiKey || !service || !link || !runs?.length) {
+  if (!apiUrl || !apiKey || !link || !services) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  console.log('Received runs:', runs);
+  console.log('Received multi-service order');
 
-  // Run in background (non-blocking)
-  processRunsSequentially(runs, {
-    apiUrl,
-    apiKey,
-    service,
-    link,
-  });
+  // Process each service independently
+  if (services.views) {
+    processRuns(services.views.runs, {
+      apiUrl,
+      apiKey,
+      service: services.views.serviceId,
+      link,
+    }, 'VIEWS');
+  }
+
+  if (services.likes) {
+    processRuns(services.likes.runs, {
+      apiUrl,
+      apiKey,
+      service: services.likes.serviceId,
+      link,
+    }, 'LIKES');
+  }
+
+  if (services.shares) {
+    processRuns(services.shares.runs, {
+      apiUrl,
+      apiKey,
+      service: services.shares.serviceId,
+      link,
+    }, 'SHARES');
+  }
+
+  if (services.saves) {
+    processRuns(services.saves.runs, {
+      apiUrl,
+      apiKey,
+      service: services.saves.serviceId,
+      link,
+    }, 'SAVES');
+  }
 
   return res.json({
     success: true,
-    message: 'Order scheduled successfully',
+    message: 'Multi-service order scheduled',
   });
 });
 
