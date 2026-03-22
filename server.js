@@ -1,12 +1,29 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
+
+const DATA_FILE = 'runs.json';
+
+/* =========================
+   LOAD + SAVE RUNS
+========================= */
+function loadRuns() {
+  if (!fs.existsSync(DATA_FILE)) return [];
+  return JSON.parse(fs.readFileSync(DATA_FILE));
+}
+
+function saveRuns(runs) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(runs, null, 2));
+}
+
+let allRuns = loadRuns();
 
 /* =========================
    PLACE ORDER
@@ -28,83 +45,74 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   EXECUTE RUN (NEW FUNCTION)
+   ADD RUNS TO STORAGE
 ========================= */
-async function executeRun(run, config, label, index) {
-  try {
-    console.log(`[${label}] Executing run ${index + 1}`, run);
-
-    if (!run.quantity || run.quantity <= 0) {
-      console.log(`[${label}] Skipped (quantity 0)`);
-      return;
-    }
-
-    const result = await placeOrder({
-      apiUrl: config.apiUrl,
-      apiKey: config.apiKey,
-      service: config.service,
-      link: config.link,
-      quantity: run.quantity,
-    });
-
-    if (result?.order) {
-      console.log(`[${label}] SUCCESS`, result.order);
-    } else {
-      console.error(`[${label}] FAILED`, result);
-    }
-
-  } catch (err) {
-    console.error(`[${label}] ERROR`, err.response?.data || err.message);
-  }
-}
-
-/* =========================
-   SCHEDULE SINGLE RUN
-========================= */
-function scheduleRun(run, config, label, index) {
-  const runTime = new Date(run.time).getTime();
-  const now = Date.now();
-
-  const delay = runTime - now;
-
-  // ✅ FIX: run immediately if past
-  if (delay <= 0) {
-    console.log(`[${label}] Run ${index + 1} time passed → executing now`);
-    executeRun(run, config, label, index);
-    return;
-  }
-
-  console.log(`[${label}] Scheduling run ${index + 1} in ${delay} ms`);
-
-  setTimeout(() => {
-    executeRun(run, config, label, index);
-  }, delay);
-}
-
-/* =========================
-   PROCESS ALL RUNS
-========================= */
-function processRuns(services, baseConfig) {
+function addRuns(services, baseConfig) {
   Object.entries(services).forEach(([key, serviceConfig]) => {
     if (!serviceConfig) return;
 
     const label = key.toUpperCase();
 
     serviceConfig.runs.forEach((run, index) => {
-      scheduleRun(
-        run,
-        {
-          apiUrl: baseConfig.apiUrl,
-          apiKey: baseConfig.apiKey,
-          service: serviceConfig.serviceId,
-          link: baseConfig.link,
-        },
+      allRuns.push({
+        id: Date.now() + Math.random(),
         label,
-        index
-      );
+        apiUrl: baseConfig.apiUrl,
+        apiKey: baseConfig.apiKey,
+        service: serviceConfig.serviceId,
+        link: baseConfig.link,
+        quantity: run.quantity,
+        time: run.time,
+        done: false,
+      });
     });
   });
+
+  saveRuns(allRuns);
 }
+
+/* =========================
+   EXECUTE RUN
+========================= */
+async function executeRun(run) {
+  try {
+    if (!run.quantity || run.quantity <= 0) return;
+
+    console.log(`[${run.label}] Executing`, run);
+
+    const result = await placeOrder(run);
+
+    if (result?.order) {
+      console.log(`[${run.label}] SUCCESS`, result.order);
+      run.done = true;
+    } else {
+      console.error(`[${run.label}] FAILED`, result);
+    }
+
+  } catch (err) {
+    console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
+  }
+}
+
+/* =========================
+   MAIN SCHEDULER (EVERY 10 SEC)
+========================= */
+setInterval(async () => {
+  const now = Date.now();
+
+  for (let run of allRuns) {
+    if (run.done) continue;
+
+    const runTime = new Date(run.time).getTime();
+
+    if (runTime <= now) {
+      await executeRun(run);
+    }
+  }
+
+  saveRuns(allRuns);
+
+}, 10000); // every 10 sec
 
 /* =========================
    CREATE ORDER
@@ -116,13 +124,13 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  console.log('Received order with real-time scheduling');
+  console.log('Saving runs for scheduler');
 
-  processRuns(services, { apiUrl, apiKey, link });
+  addRuns(services, { apiUrl, apiKey, link });
 
   return res.json({
     success: true,
-    message: 'Order scheduled with real-time execution',
+    message: 'Order scheduled (persistent)',
   });
 });
 
