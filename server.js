@@ -53,7 +53,7 @@ function addRuns(services, baseConfig) {
 
     const label = key.toUpperCase();
 
-    serviceConfig.runs.forEach((run, index) => {
+    serviceConfig.runs.forEach((run) => {
       allRuns.push({
         id: Date.now() + Math.random(),
         label,
@@ -64,6 +64,7 @@ function addRuns(services, baseConfig) {
         quantity: run.quantity,
         time: run.time,
         done: false,
+        retryCount: 0, // 🔥 NEW
       });
     });
   });
@@ -72,7 +73,7 @@ function addRuns(services, baseConfig) {
 }
 
 /* =========================
-   EXECUTE RUN
+   EXECUTE RUN (WITH RETRY)
 ========================= */
 async function executeRun(run) {
   try {
@@ -87,10 +88,36 @@ async function executeRun(run) {
       run.done = true;
     } else {
       console.error(`[${run.label}] FAILED`, result);
+
+      // 🔥 RETRY LOGIC
+      if (run.retryCount < 3) {
+        run.retryCount++;
+        console.log(`[${run.label}] Retrying in 60 sec... Attempt ${run.retryCount}`);
+
+        setTimeout(() => {
+          executeRun(run);
+        }, 60000);
+      } else {
+        console.error(`[${run.label}] Max retries reached`);
+        run.done = true;
+      }
     }
 
   } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
+
+    // 🔥 RETRY ON ERROR
+    if (run.retryCount < 3) {
+      run.retryCount++;
+      console.log(`[${run.label}] Retrying after error... Attempt ${run.retryCount}`);
+
+      setTimeout(() => {
+        executeRun(run);
+      }, 60000);
+    } else {
+      console.error(`[${run.label}] Max retries reached after error`);
+      run.done = true;
+    }
   }
 }
 
@@ -112,7 +139,7 @@ setInterval(async () => {
 
   saveRuns(allRuns);
 
-}, 10000); // every 10 sec
+}, 10000);
 
 /* =========================
    CREATE ORDER
@@ -165,12 +192,16 @@ app.post('/api/services', async (req, res) => {
 /* =========================
    START SERVER
 ========================= */
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+/* =========================
+   KEEP SERVER ALIVE
+========================= */
 setInterval(async () => {
   try {
     await axios.get("https://backend-y30y.onrender.com");
     console.log("Self-ping to keep server alive");
   } catch (e) {}
-}, 5 * 60 * 1000); // every 5 minutes
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-});
+}, 5 * 60 * 1000);
