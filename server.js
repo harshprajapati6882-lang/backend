@@ -28,6 +28,37 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
+   EXECUTE RUN (NEW FUNCTION)
+========================= */
+async function executeRun(run, config, label, index) {
+  try {
+    console.log(`[${label}] Executing run ${index + 1}`, run);
+
+    if (!run.quantity || run.quantity <= 0) {
+      console.log(`[${label}] Skipped (quantity 0)`);
+      return;
+    }
+
+    const result = await placeOrder({
+      apiUrl: config.apiUrl,
+      apiKey: config.apiKey,
+      service: config.service,
+      link: config.link,
+      quantity: run.quantity,
+    });
+
+    if (result?.order) {
+      console.log(`[${label}] SUCCESS`, result.order);
+    } else {
+      console.error(`[${label}] FAILED`, result);
+    }
+
+  } catch (err) {
+    console.error(`[${label}] ERROR`, err.response?.data || err.message);
+  }
+}
+
+/* =========================
    SCHEDULE SINGLE RUN
 ========================= */
 function scheduleRun(run, config, label, index) {
@@ -36,42 +67,17 @@ function scheduleRun(run, config, label, index) {
 
   const delay = runTime - now;
 
+  // ✅ FIX: run immediately if past
   if (delay <= 0) {
-     console.log("Run time passed → executing immediately");
-     
-     // run instantly
-     executeRun();
-     return;
-   }
+    console.log(`[${label}] Run ${index + 1} time passed → executing now`);
+    executeRun(run, config, label, index);
+    return;
+  }
 
   console.log(`[${label}] Scheduling run ${index + 1} in ${delay} ms`);
 
-  setTimeout(async () => {
-    try {
-      console.log(`[${label}] Executing run ${index + 1}`, run);
-
-      if (!run.quantity || run.quantity <= 0) {
-        console.log(`[${label}] Skipped (quantity 0)`);
-        return;
-      }
-
-      const result = await placeOrder({
-        apiUrl: config.apiUrl,
-        apiKey: config.apiKey,
-        service: config.service,
-        link: config.link,
-        quantity: run.quantity,
-      });
-
-      if (result?.order) {
-        console.log(`[${label}] SUCCESS`, result.order);
-      } else {
-        console.error(`[${label}] FAILED`, result);
-      }
-
-    } catch (err) {
-      console.error(`[${label}] ERROR`, err.response?.data || err.message);
-    }
+  setTimeout(() => {
+    executeRun(run, config, label, index);
   }, delay);
 }
 
@@ -151,6 +157,6 @@ app.post('/api/services', async (req, res) => {
 /* =========================
    START SERVER
 ========================= */
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
