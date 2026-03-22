@@ -1,12 +1,29 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
+
+const DATA_FILE = 'orders.json';
+
+/* =========================
+   LOAD + SAVE ORDERS
+========================= */
+function loadOrders() {
+  if (!fs.existsSync(DATA_FILE)) return [];
+  return JSON.parse(fs.readFileSync(DATA_FILE));
+}
+
+function saveOrders(orders) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(orders, null, 2));
+}
+
+let orders = loadOrders();
 
 /* =========================
    HELPER: PLACE ORDER
@@ -28,11 +45,14 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   PROCESS RUNS (PER SERVICE)
+   PROCESS RUNS (SAFE)
 ========================= */
-async function processRuns(runs, config, label) {
+async function processRuns(orderId, serviceKey, runs, config, label) {
   for (let i = 0; i < runs.length; i++) {
     const run = runs[i];
+
+    // skip already completed
+    if (run.done) continue;
 
     console.log(`[${label}] Run ${i + 1}`, run);
 
@@ -47,6 +67,7 @@ async function processRuns(runs, config, label) {
 
       if (result?.order) {
         console.log(`[${label}] SUCCESS:`, result.order);
+        run.done = true;
       } else if (result?.error) {
         console.error(`[${label}] FAILED:`, result.error);
       } else if (result?.status === 'fail') {
@@ -59,13 +80,62 @@ async function processRuns(runs, config, label) {
       console.error(`[${label}] ERROR:`, err.response?.data || err.message);
     }
 
+    saveOrders(orders);
+
     // wait before next run
     await new Promise(resolve => setTimeout(resolve, 60000));
   }
 }
 
 /* =========================
-   CREATE ORDER (MULTI SERVICE)
+   RESUME ORDERS ON START
+========================= */
+function resumeOrders() {
+  console.log('Resuming saved orders...');
+
+  orders.forEach(order => {
+    const { apiUrl, apiKey, link, services } = order;
+
+    if (services.views) {
+      processRuns(order.id, 'views', services.views.runs, {
+        apiUrl,
+        apiKey,
+        service: services.views.serviceId,
+        link,
+      }, 'VIEWS');
+    }
+
+    if (services.likes) {
+      processRuns(order.id, 'likes', services.likes.runs, {
+        apiUrl,
+        apiKey,
+        service: services.likes.serviceId,
+        link,
+      }, 'LIKES');
+    }
+
+    if (services.shares) {
+      processRuns(order.id, 'shares', services.shares.runs, {
+        apiUrl,
+        apiKey,
+        service: services.shares.serviceId,
+        link,
+      }, 'SHARES');
+    }
+
+    if (services.saves) {
+      processRuns(order.id, 'saves', services.saves.runs, {
+        apiUrl,
+        apiKey,
+        service: services.saves.serviceId,
+        link,
+      }, 'SAVES');
+    }
+  });
+}
+
+/* =========================
+   CREATE ORDER
 ========================= */
 app.post('/api/order', async (req, res) => {
   const { apiUrl, apiKey, link, services } = req.body;
@@ -74,48 +144,30 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  console.log('Received multi-service order');
+  const order = {
+    id: Date.now(),
+    apiUrl,
+    apiKey,
+    link,
+    services
+  };
 
-  // Process each service independently
-  if (services.views) {
-    processRuns(services.views.runs, {
-      apiUrl,
-      apiKey,
-      service: services.views.serviceId,
-      link,
-    }, 'VIEWS');
-  }
+  // initialize run status
+  Object.values(order.services).forEach(s => {
+    s.runs.forEach(run => run.done = false);
+  });
 
-  if (services.likes) {
-    processRuns(services.likes.runs, {
-      apiUrl,
-      apiKey,
-      service: services.likes.serviceId,
-      link,
-    }, 'LIKES');
-  }
+  orders.push(order);
+  saveOrders(orders);
 
-  if (services.shares) {
-    processRuns(services.shares.runs, {
-      apiUrl,
-      apiKey,
-      service: services.shares.serviceId,
-      link,
-    }, 'SHARES');
-  }
+  console.log('New order saved:', order.id);
 
-  if (services.saves) {
-    processRuns(services.saves.runs, {
-      apiUrl,
-      apiKey,
-      service: services.saves.serviceId,
-      link,
-    }, 'SAVES');
-  }
+  // start processing
+  resumeOrders();
 
   return res.json({
     success: true,
-    message: 'Multi-service order scheduled',
+    message: 'Order scheduled safely',
   });
 });
 
@@ -152,4 +204,5 @@ app.post('/api/services', async (req, res) => {
 ========================= */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  resumeOrders(); // auto resume
 });
