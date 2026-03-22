@@ -45,92 +45,98 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   PROCESS RUNS (SAFE)
+   HELPER: PLACE + MARK
 ========================= */
-async function processRuns(orderId, serviceKey, runs, config, label) {
-  for (let i = 0; i < runs.length; i++) {
-    const run = runs[i];
+async function placeAndMark(run, config, label) {
+  try {
+    const result = await placeOrder({
+      apiUrl: config.apiUrl,
+      apiKey: config.apiKey,
+      service: config.service,
+      link: config.link,
+      quantity: run.quantity,
+    });
 
-    // skip already completed
-    if (run.done) continue;
+    if (result?.order) {
+      console.log(`[${label}] SUCCESS`, result.order);
+      run.done = true;
+    } else {
+      console.error(`[${label}] FAILED`, result);
+    }
+  } catch (err) {
+    console.error(`[${label}] ERROR`, err.response?.data || err.message);
+  }
+}
 
-    console.log(`[${label}] Run ${i + 1}`, run);
+/* =========================
+   NEW: RUN-BASED EXECUTION
+========================= */
+async function processRunsByTime(order) {
+  const { apiUrl, apiKey, link, services } = order;
 
-    try {
-      const result = await placeOrder({
-        apiUrl: config.apiUrl,
-        apiKey: config.apiKey,
-        service: config.service,
-        link: config.link,
-        quantity: run.quantity,
-      });
+  const totalRuns = services.views?.runs.length || 0;
 
-      if (result?.order) {
-        console.log(`[${label}] SUCCESS:`, result.order);
-        run.done = true;
-      } else if (result?.error) {
-        console.error(`[${label}] FAILED:`, result.error);
-      } else if (result?.status === 'fail') {
-        console.error(`[${label}] FAILED:`, result.message);
-      } else {
-        console.error(`[${label}] UNKNOWN:`, result);
-      }
+  for (let i = 0; i < totalRuns; i++) {
 
-    } catch (err) {
-      console.error(`[${label}] ERROR:`, err.response?.data || err.message);
+    console.log(`===== RUN ${i + 1} START =====`);
+
+    // VIEWS
+    if (services.views?.runs[i] && !services.views.runs[i].done) {
+      await placeAndMark(services.views.runs[i], {
+        apiUrl,
+        apiKey,
+        service: services.views.serviceId,
+        link
+      }, 'VIEWS');
+    }
+
+    // LIKES
+    if (services.likes?.runs[i] && !services.likes.runs[i].done) {
+      await placeAndMark(services.likes.runs[i], {
+        apiUrl,
+        apiKey,
+        service: services.likes.serviceId,
+        link
+      }, 'LIKES');
+    }
+
+    // SHARES
+    if (services.shares?.runs[i] && !services.shares.runs[i].done) {
+      await placeAndMark(services.shares.runs[i], {
+        apiUrl,
+        apiKey,
+        service: services.shares.serviceId,
+        link
+      }, 'SHARES');
+    }
+
+    // SAVES
+    if (services.saves?.runs[i] && !services.saves.runs[i].done) {
+      await placeAndMark(services.saves.runs[i], {
+        apiUrl,
+        apiKey,
+        service: services.saves.serviceId,
+        link
+      }, 'SAVES');
     }
 
     saveOrders(orders);
 
-    // wait before next run
+    console.log(`===== RUN ${i + 1} DONE =====`);
+
+    // WAIT BETWEEN RUNS
     await new Promise(resolve => setTimeout(resolve, 60000));
   }
 }
 
 /* =========================
-   RESUME ORDERS ON START
+   RESUME ORDERS
 ========================= */
 function resumeOrders() {
-  console.log('Resuming saved orders...');
+  console.log('Resuming orders...');
 
   orders.forEach(order => {
-    const { apiUrl, apiKey, link, services } = order;
-
-    if (services.views) {
-      processRuns(order.id, 'views', services.views.runs, {
-        apiUrl,
-        apiKey,
-        service: services.views.serviceId,
-        link,
-      }, 'VIEWS');
-    }
-
-    if (services.likes) {
-      processRuns(order.id, 'likes', services.likes.runs, {
-        apiUrl,
-        apiKey,
-        service: services.likes.serviceId,
-        link,
-      }, 'LIKES');
-    }
-
-    if (services.shares) {
-      processRuns(order.id, 'shares', services.shares.runs, {
-        apiUrl,
-        apiKey,
-        service: services.shares.serviceId,
-        link,
-      }, 'SHARES');
-    }
-
-    if (services.saves) {
-      processRuns(order.id, 'saves', services.saves.runs, {
-        apiUrl,
-        apiKey,
-        service: services.saves.serviceId,
-        link,
-      }, 'SAVES');
-    }
+    processRunsByTime(order);
   });
 }
 
@@ -152,7 +158,6 @@ app.post('/api/order', async (req, res) => {
     services
   };
 
-  // initialize run status
   Object.values(order.services).forEach(s => {
     s.runs.forEach(run => run.done = false);
   });
@@ -160,10 +165,9 @@ app.post('/api/order', async (req, res) => {
   orders.push(order);
   saveOrders(orders);
 
-  console.log('New order saved:', order.id);
+  console.log('Order created:', order.id);
 
-  // start processing
-  resumeOrders();
+  processRunsByTime(order);
 
   return res.json({
     success: true,
@@ -204,5 +208,5 @@ app.post('/api/services', async (req, res) => {
 ========================= */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  resumeOrders(); // auto resume
+  resumeOrders();
 });
