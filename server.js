@@ -69,19 +69,28 @@ async function placeAndMark(run, config, label) {
 }
 
 /* =========================
-   NEW: RUN-BASED EXECUTION
+   FIXED RUN-BASED EXECUTION
 ========================= */
 async function processRunsByTime(order) {
   const { apiUrl, apiKey, link, services } = order;
 
-  const totalRuns = services.views?.runs.length || 0;
+  const totalRuns = Math.max(
+    services.views?.runs.length || 0,
+    services.likes?.runs.length || 0,
+    services.shares?.runs.length || 0,
+    services.saves?.runs.length || 0
+  );
 
   for (let i = 0; i < totalRuns; i++) {
 
     console.log(`===== RUN ${i + 1} START =====`);
 
     // VIEWS
-    if (services.views?.runs[i] && !services.views.runs[i].done) {
+    if (
+      services.views?.runs[i] &&
+      services.views.runs[i].quantity > 0 &&
+      !services.views.runs[i].done
+    ) {
       await placeAndMark(services.views.runs[i], {
         apiUrl,
         apiKey,
@@ -91,7 +100,11 @@ async function processRunsByTime(order) {
     }
 
     // LIKES
-    if (services.likes?.runs[i] && !services.likes.runs[i].done) {
+    if (
+      services.likes?.runs[i] &&
+      services.likes.runs[i].quantity > 0 &&
+      !services.likes.runs[i].done
+    ) {
       await placeAndMark(services.likes.runs[i], {
         apiUrl,
         apiKey,
@@ -100,8 +113,12 @@ async function processRunsByTime(order) {
       }, 'LIKES');
     }
 
-    // SHARES
-    if (services.shares?.runs[i] && !services.shares.runs[i].done) {
+    // SHARES (minimum 20)
+    if (
+      services.shares?.runs[i] &&
+      services.shares.runs[i].quantity >= 20 &&
+      !services.shares.runs[i].done
+    ) {
       await placeAndMark(services.shares.runs[i], {
         apiUrl,
         apiKey,
@@ -110,8 +127,13 @@ async function processRunsByTime(order) {
       }, 'SHARES');
     }
 
-    // SAVES
-    if (services.saves?.runs[i] && !services.saves.runs[i].done) {
+    // SAVES (skip first run)
+    if (
+      i !== 0 &&
+      services.saves?.runs[i] &&
+      services.saves.runs[i].quantity > 0 &&
+      !services.saves.runs[i].done
+    ) {
       await placeAndMark(services.saves.runs[i], {
         apiUrl,
         apiKey,
