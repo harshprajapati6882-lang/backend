@@ -64,7 +64,9 @@ function addRuns(services, baseConfig) {
         quantity: run.quantity,
         time: run.time,
         done: false,
-        retryCount: 0, // 🔥 NEW
+        cancelled: false,
+        retryCount: 0,
+        isExecuting: false, // 🔥 NEW (prevents duplicate runs)
       });
     });
   });
@@ -73,15 +75,27 @@ function addRuns(services, baseConfig) {
 }
 
 /* =========================
-   EXECUTE RUN (WITH RETRY)
+   EXECUTE RUN (SAFE + RETRY)
 ========================= */
 async function executeRun(run) {
+  if (run.cancelled || run.done || run.isExecuting) return;
+
+  run.isExecuting = true;
+
   try {
-    if (!run.quantity || run.quantity <= 0) return;
+    if (!run.quantity || run.quantity <= 0) {
+      run.isExecuting = false;
+      return;
+    }
 
     console.log(`[${run.label}] Executing`, run);
 
     const result = await placeOrder(run);
+
+    if (run.cancelled) {
+      run.isExecuting = false;
+      return;
+    }
 
     if (result?.order) {
       console.log(`[${run.label}] SUCCESS`, result.order);
@@ -89,14 +103,11 @@ async function executeRun(run) {
     } else {
       console.error(`[${run.label}] FAILED`, result);
 
-      // 🔥 RETRY LOGIC
-      if (run.retryCount < 3) {
+      if (run.retryCount < 3 && !run.cancelled) {
         run.retryCount++;
         console.log(`[${run.label}] Retrying in 60 sec... Attempt ${run.retryCount}`);
 
-        setTimeout(() => {
-          executeRun(run);
-        }, 60000);
+        setTimeout(() => executeRun(run), 60000);
       } else {
         console.error(`[${run.label}] Max retries reached`);
         run.done = true;
@@ -106,29 +117,28 @@ async function executeRun(run) {
   } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
 
-    // 🔥 RETRY ON ERROR
-    if (run.retryCount < 3) {
+    if (run.retryCount < 3 && !run.cancelled) {
       run.retryCount++;
       console.log(`[${run.label}] Retrying after error... Attempt ${run.retryCount}`);
 
-      setTimeout(() => {
-        executeRun(run);
-      }, 60000);
+      setTimeout(() => executeRun(run), 60000);
     } else {
       console.error(`[${run.label}] Max retries reached after error`);
       run.done = true;
     }
   }
+
+  run.isExecuting = false;
 }
 
 /* =========================
-   MAIN SCHEDULER (EVERY 10 SEC)
+   MAIN SCHEDULER
 ========================= */
 setInterval(async () => {
   const now = Date.now();
 
   for (let run of allRuns) {
-    if (run.done) continue;
+    if (run.done || run.cancelled) continue;
 
     const runTime = new Date(run.time).getTime();
 
@@ -158,6 +168,35 @@ app.post('/api/order', async (req, res) => {
   return res.json({
     success: true,
     message: 'Order scheduled (persistent)',
+  });
+});
+
+/* =========================
+   🔥 CANCEL ORDER (REAL FIX)
+========================= */
+app.post('/api/cancel', (req, res) => {
+  const { link } = req.body;
+
+  if (!link) {
+    return res.status(400).json({ error: 'Missing link' });
+  }
+
+  let cancelledCount = 0;
+
+  allRuns.forEach(run => {
+    if (run.link === link && !run.done) {
+      run.cancelled = true;
+      cancelledCount++;
+    }
+  });
+
+  saveRuns(allRuns);
+
+  console.log(`Cancelled ${cancelledCount} runs for link: ${link}`);
+
+  return res.json({
+    success: true,
+    cancelledRuns: cancelledCount,
   });
 });
 
