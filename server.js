@@ -17,7 +17,8 @@ const RETRY_DELAY_MINUTES = 5;
 const MAX_RETRY_HOURS = 4;
 const STATUS_CACHE_MINUTES = 2;
 
-// 🔥 Active SMM orders tracker per link
+// 🔥 Active SMM orders tracker per link + service type
+// Key format: "link:LABEL" (e.g., "instagram.com/reel/ABC:VIEWS")
 let linkTracker = {};
 
 // Status values that mean "order is still active"
@@ -28,6 +29,13 @@ const ACTIVE_ORDER_STATUSES = [
   'partial',
   'inprogress',
 ];
+
+/* =========================
+   🔥 GET TRACKER KEY (Link + Service Type)
+========================= */
+function getTrackerKey(link, label) {
+  return `${link}:${label}`;
+}
 
 /* =========================
    LOAD + SAVE
@@ -76,12 +84,9 @@ let allRuns = loadRuns();
 linkTracker = loadLinkTracker();
 
 console.log(`[Startup] Loaded ${allRuns.length} runs`);
-console.log(`[Startup] Tracking ${Object.keys(linkTracker).length} active links`);
+console.log(`[Startup] Tracking ${Object.keys(linkTracker).length} active link+service combinations`);
 
 const executingRunIds = new Set();
-
-// 🔥 NEW: Track which links are currently being processed (in this scheduler cycle)
-const linksBeingProcessed = new Set();
 
 /* =========================
    CHECK ORDER STATUS (SMM PANEL API)
@@ -117,10 +122,11 @@ async function checkOrderStatus(apiUrl, apiKey, smmOrderId) {
 }
 
 /* =========================
-   CHECK IF LINK HAS ACTIVE ORDER
+   🔥 CHECK IF LINK+SERVICE HAS ACTIVE ORDER
 ========================= */
-async function hasActiveSmmOrder(link, apiUrl, apiKey) {
-  const tracker = linkTracker[link];
+async function hasActiveSmmOrder(link, label, apiUrl, apiKey) {
+  const trackerKey = getTrackerKey(link, label);
+  const tracker = linkTracker[trackerKey];
   
   if (!tracker || !tracker.smmOrderId) {
     return false;
@@ -132,18 +138,18 @@ async function hasActiveSmmOrder(link, apiUrl, apiKey) {
 
   // If cache is fresh and status was active, assume still active
   if (!cacheExpired && tracker.isActive) {
-    console.log(`[Link Check] ${link.slice(-30)} - Using cached status (active)`);
+    console.log(`[Link Check] ${label} for ${link.slice(-30)} - Using cached status (active)`);
     return true;
   }
 
   // Cache expired or was inactive - check again
-  console.log(`[Link Check] ${link.slice(-30)} - Checking SMM order ${tracker.smmOrderId}...`);
+  console.log(`[Link Check] ${label} for ${link.slice(-30)} - Checking SMM order ${tracker.smmOrderId}...`);
   
   const statusResult = await checkOrderStatus(apiUrl, apiKey, tracker.smmOrderId);
 
   if (!statusResult) {
     // API failed - assume inactive to avoid blocking
-    console.warn(`[Link Check] ${link.slice(-30)} - Status check failed, assuming inactive`);
+    console.warn(`[Link Check] ${label} for ${link.slice(-30)} - Status check failed, assuming inactive`);
     tracker.isActive = false;
     tracker.lastChecked = new Date().toISOString();
     saveLinkTracker(linkTracker);
@@ -158,12 +164,12 @@ async function hasActiveSmmOrder(link, apiUrl, apiKey) {
   tracker.lastChecked = new Date().toISOString();
   tracker.remains = statusResult.remains;
 
-  console.log(`[Link Check] ${link.slice(-30)} - Status: ${statusResult.status}, Active: ${isActive}, Remains: ${statusResult.remains}`);
+  console.log(`[Link Check] ${label} for ${link.slice(-30)} - Status: ${statusResult.status}, Active: ${isActive}, Remains: ${statusResult.remains}`);
 
   // If order completed, remove from tracker
   if (!isActive) {
-    console.log(`[Link Check] ${link.slice(-30)} - Order completed, removing from tracker`);
-    delete linkTracker[link];
+    console.log(`[Link Check] ${label} for ${link.slice(-30)} - Order completed, removing from tracker`);
+    delete linkTracker[trackerKey];
   }
 
   saveLinkTracker(linkTracker);
@@ -172,10 +178,14 @@ async function hasActiveSmmOrder(link, apiUrl, apiKey) {
 }
 
 /* =========================
-   REGISTER SMM ORDER FOR LINK
+   🔥 REGISTER SMM ORDER FOR LINK+SERVICE
 ========================= */
-function registerSmmOrder(link, smmOrderId, apiUrl) {
-  linkTracker[link] = {
+function registerSmmOrder(link, label, smmOrderId, apiUrl) {
+  const trackerKey = getTrackerKey(link, label);
+  
+  linkTracker[trackerKey] = {
+    link,
+    label,
     smmOrderId,
     apiUrl,
     createdAt: new Date().toISOString(),
@@ -185,7 +195,7 @@ function registerSmmOrder(link, smmOrderId, apiUrl) {
     remains: 0,
   };
   saveLinkTracker(linkTracker);
-  console.log(`[Link Tracker] Registered order ${smmOrderId} for ${link.slice(-30)}`);
+  console.log(`[Link Tracker] Registered ${label} order ${smmOrderId} for ${link.slice(-30)}`);
 }
 
 /* =========================
@@ -247,7 +257,7 @@ function addRuns(services, baseConfig, schedulerOrderId) {
         quantity: run.quantity,
         originalTime: runTime,
         time: runTime,
-        runIndex: index + 1, // 🔥 NEW: Track run order (1, 2, 3, 4...)
+        runIndex: index + 1,
         done: false,
         cancelled: false,
         paused: false,
@@ -291,14 +301,15 @@ function handleRunRetry(run, errorMessage, reason = 'API Error') {
 }
 
 /* =========================
-   🔥 GET NEXT PENDING RUN FOR A LINK (Ordered by originalTime)
+   🔥 GET NEXT PENDING RUN FOR A LINK+SERVICE (Ordered by originalTime)
 ========================= */
-function getNextPendingRunForLink(link) {
+function getNextPendingRunForLinkAndService(link, label) {
   const now = Date.now();
   
-  // Get all pending runs for this link
-  const pendingRunsForLink = allRuns.filter(run => 
+  // Get all pending runs for this link + service type
+  const pendingRunsForLinkAndService = allRuns.filter(run => 
     run.link === link &&
+    run.label === label &&
     !run.done &&
     !run.cancelled &&
     !run.paused &&
@@ -307,12 +318,12 @@ function getNextPendingRunForLink(link) {
     new Date(run.time).getTime() <= now
   );
 
-  if (pendingRunsForLink.length === 0) {
+  if (pendingRunsForLinkAndService.length === 0) {
     return null;
   }
 
   // 🔥 Sort by ORIGINAL time (first scheduled = first executed)
-  pendingRunsForLink.sort((a, b) => {
+  pendingRunsForLinkAndService.sort((a, b) => {
     const timeA = new Date(a.originalTime).getTime();
     const timeB = new Date(b.originalTime).getTime();
     
@@ -325,15 +336,15 @@ function getNextPendingRunForLink(link) {
   });
 
   // Return the first one (lowest original time)
-  return pendingRunsForLink[0];
+  return pendingRunsForLinkAndService[0];
 }
 
 /* =========================
-   🔥 GET ALL LINKS WITH PENDING RUNS
+   🔥 GET ALL LINK+SERVICE COMBINATIONS WITH PENDING RUNS
 ========================= */
-function getLinksWithPendingRuns() {
+function getLinkServiceCombinationsWithPendingRuns() {
   const now = Date.now();
-  const links = new Set();
+  const combinations = new Set();
 
   allRuns.forEach(run => {
     if (
@@ -344,11 +355,15 @@ function getLinksWithPendingRuns() {
       !executingRunIds.has(run.id) &&
       new Date(run.time).getTime() <= now
     ) {
-      links.add(run.link);
+      const key = getTrackerKey(run.link, run.label);
+      combinations.add(key);
     }
   });
 
-  return Array.from(links);
+  return Array.from(combinations).map(key => {
+    const [link, label] = key.split(':');
+    return { link, label };
+  });
 }
 
 /* =========================
@@ -377,15 +392,15 @@ async function executeRun(run) {
     return;
   }
 
-  // 🔥 CHECK IF LINK HAS ACTIVE ORDER
-  const linkHasActiveOrder = await hasActiveSmmOrder(run.link, run.apiUrl, run.apiKey);
+  // 🔥 CHECK IF THIS LINK+SERVICE HAS ACTIVE ORDER
+  const linkServiceHasActiveOrder = await hasActiveSmmOrder(run.link, run.label, run.apiUrl, run.apiKey);
 
-  if (linkHasActiveOrder) {
-    console.log(`[${run.label}] 🔒 Link has active order - rescheduling Run #${run.runIndex || '?'}...`);
+  if (linkServiceHasActiveOrder) {
+    console.log(`[${run.label}] 🔒 Link+Service has active order - rescheduling Run #${run.runIndex || '?'}...`);
     handleRunRetry(
       run,
-      'Link has active SMM order',
-      'Waiting for previous order to complete'
+      `${run.label} order for this link is still active`,
+      `Waiting for previous ${run.label} order to complete`
     );
     saveRuns(allRuns);
     return;
@@ -413,7 +428,7 @@ async function executeRun(run) {
     }
 
     if (result?.order) {
-      // 🔥 SUCCESS - Register SMM order for this link
+      // 🔥 SUCCESS - Register SMM order for this link + service type
       const smmOrderId = String(result.order);
       console.log(`[${run.label}] ✅ SUCCESS Run #${run.runIndex || '?'} - SMM Order: ${smmOrderId}`);
       
@@ -423,8 +438,8 @@ async function executeRun(run) {
       run.lastError = null;
       run.retryReason = null;
 
-      // 🔥 Register this order for the link
-      registerSmmOrder(run.link, smmOrderId, run.apiUrl);
+      // 🔥 Register this order for the link + service type
+      registerSmmOrder(run.link, run.label, smmOrderId, run.apiUrl);
 
     } else if (result?.error) {
       console.error(`[${run.label}] ❌ API Error:`, result.error);
@@ -446,7 +461,7 @@ async function executeRun(run) {
 }
 
 /* =========================
-   🔥 MAIN SCHEDULER (FIXED - ORDERED EXECUTION)
+   🔥 MAIN SCHEDULER (ORDERED EXECUTION PER LINK+SERVICE)
 ========================= */
 let isSchedulerRunning = false;
 
@@ -458,42 +473,41 @@ async function runScheduler() {
   isSchedulerRunning = true;
 
   try {
-    // 🔥 Clean up cancelled runs
+    // Clean up cancelled runs
     allRuns.forEach(run => {
       if (run.cancelled && !run.done) {
         run.done = true;
       }
     });
 
-    // 🔥 Get all unique links that have pending runs
-    const linksWithPendingRuns = getLinksWithPendingRuns();
+    // 🔥 Get all unique link+service combinations that have pending runs
+    const linkServiceCombinations = getLinkServiceCombinationsWithPendingRuns();
 
-    if (linksWithPendingRuns.length === 0) {
-      // No pending runs, skip
+    if (linkServiceCombinations.length === 0) {
       isSchedulerRunning = false;
       return;
     }
 
-    console.log(`[Scheduler] Found ${linksWithPendingRuns.length} links with pending runs`);
+    console.log(`[Scheduler] Found ${linkServiceCombinations.length} link+service combinations with pending runs`);
 
-    // 🔥 Process ONE run per link (the one with lowest originalTime)
+    // 🔥 Process ONE run per link+service combination (the one with lowest originalTime)
     const runsToExecute = [];
 
-    for (const link of linksWithPendingRuns) {
-      // Get the NEXT run for this link (ordered by originalTime)
-      const nextRun = getNextPendingRunForLink(link);
+    for (const { link, label } of linkServiceCombinations) {
+      // Get the NEXT run for this link+service (ordered by originalTime)
+      const nextRun = getNextPendingRunForLinkAndService(link, label);
       
       if (nextRun) {
         runsToExecute.push(nextRun);
-        console.log(`[Scheduler] Queued Run #${nextRun.runIndex || '?'} for ${link.slice(-30)} (original: ${nextRun.originalTime})`);
+        console.log(`[Scheduler] Queued ${label} Run #${nextRun.runIndex || '?'} for ${link.slice(-30)} (original: ${nextRun.originalTime})`);
       }
     }
 
     if (runsToExecute.length > 0) {
-      console.log(`[Scheduler] Processing ${runsToExecute.length} runs (1 per link, ordered)...`);
+      console.log(`[Scheduler] Processing ${runsToExecute.length} runs (1 per link+service, ordered)...`);
       
-      // Execute all runs in parallel (but only 1 per link!)
-      const CONCURRENCY_LIMIT = 5;
+      // Execute all runs in parallel (different link+service combinations can run simultaneously!)
+      const CONCURRENCY_LIMIT = 10;
       
       for (let i = 0; i < runsToExecute.length; i += CONCURRENCY_LIMIT) {
         const batch = runsToExecute.slice(i, i + CONCURRENCY_LIMIT);
@@ -513,7 +527,7 @@ async function runScheduler() {
       retrying: allRuns.filter(r => !r.done && !r.cancelled && r.retryCount > 0).length,
       done: allRuns.filter(r => r.done && !r.cancelled).length,
       cancelled: allRuns.filter(r => r.cancelled).length,
-      activeLinks: Object.keys(linkTracker).length,
+      activeLinkServices: Object.keys(linkTracker).length,
     };
     
     if (runsToExecute.length > 0) {
@@ -659,8 +673,13 @@ app.get('/api/order/runs/:schedulerOrderId', (req, res) => {
     return res.status(404).json({ error: 'Order not found' });
   }
 
-  // 🔥 Sort by runIndex for consistent ordering
-  orderRuns.sort((a, b) => (a.runIndex || 0) - (b.runIndex || 0));
+  // Sort by label then runIndex
+  orderRuns.sort((a, b) => {
+    if (a.label !== b.label) {
+      return a.label.localeCompare(b.label);
+    }
+    return (a.runIndex || 0) - (b.runIndex || 0);
+  });
 
   return res.json({
     schedulerOrderId,
@@ -705,11 +724,13 @@ app.post('/api/cancel', (req, res) => {
     }
   });
 
-  // Also remove from link tracker
-  if (linkTracker[link]) {
-    delete linkTracker[link];
-    saveLinkTracker(linkTracker);
-  }
+  // Remove all link+service combinations for this link from tracker
+  Object.keys(linkTracker).forEach(key => {
+    if (key.startsWith(link + ':')) {
+      delete linkTracker[key];
+    }
+  });
+  saveLinkTracker(linkTracker);
 
   saveRuns(allRuns);
 
@@ -731,8 +752,12 @@ app.get('/api/order/status/:schedulerOrderId', (req, res) => {
     return res.status(404).json({ error: 'Order not found' });
   }
 
-  // 🔥 Sort by runIndex
-  orderRuns.sort((a, b) => (a.runIndex || 0) - (b.runIndex || 0));
+  orderRuns.sort((a, b) => {
+    if (a.label !== b.label) {
+      return a.label.localeCompare(b.label);
+    }
+    return (a.runIndex || 0) - (b.runIndex || 0);
+  });
 
   const stats = {
     total: orderRuns.length,
@@ -789,8 +814,14 @@ app.get('/api/debug/runs', (req, res) => {
 
   const pendingRuns = allRuns
     .filter(r => !r.done && !r.cancelled && !r.paused)
-    .sort((a, b) => new Date(a.originalTime).getTime() - new Date(b.originalTime).getTime())
-    .slice(0, 30)
+    .sort((a, b) => {
+      // Sort by label first, then original time
+      if (a.label !== b.label) {
+        return a.label.localeCompare(b.label);
+      }
+      return new Date(a.originalTime).getTime() - new Date(b.originalTime).getTime();
+    })
+    .slice(0, 40)
     .map(r => ({
       id: r.id,
       schedulerOrderId: r.schedulerOrderId,
@@ -810,20 +841,34 @@ app.get('/api/debug/runs', (req, res) => {
     stats,
     pendingRuns,
     executingIds: Array.from(executingRunIds),
-    activeLinks: Object.keys(linkTracker).map(link => ({
-      link: link.slice(-40),
-      ...linkTracker[link],
-    })),
+    activeLinkServices: Object.keys(linkTracker).map(key => {
+      const tracker = linkTracker[key];
+      return {
+        key,
+        link: tracker.link?.slice(-40),
+        label: tracker.label,
+        ...tracker,
+      };
+    }),
   });
 });
 
 app.get('/api/debug/link-tracker', (req, res) => {
   return res.json({
-    activeLinks: Object.keys(linkTracker).length,
-    links: Object.keys(linkTracker).map(link => ({
-      link: link.slice(-50),
-      ...linkTracker[link],
-    })),
+    activeLinkServices: Object.keys(linkTracker).length,
+    linkServices: Object.keys(linkTracker).map(key => {
+      const tracker = linkTracker[key];
+      return {
+        key,
+        link: tracker.link?.slice(-50),
+        label: tracker.label,
+        smmOrderId: tracker.smmOrderId,
+        status: tracker.status,
+        isActive: tracker.isActive,
+        remains: tracker.remains,
+        lastChecked: tracker.lastChecked,
+      };
+    }),
   });
 });
 
@@ -844,7 +889,7 @@ app.post('/api/debug/retry-stuck', (req, res) => {
       run.time = new Date().toISOString();
       run.isExecuting = false;
       fixedCount++;
-      console.log(`[Debug] Rescheduled stuck run #${run.runIndex}: ${run.id}`);
+      console.log(`[Debug] Rescheduled stuck ${run.label} run #${run.runIndex}: ${run.id}`);
     }
   });
 
@@ -856,17 +901,16 @@ app.post('/api/debug/retry-stuck', (req, res) => {
   });
 });
 
-// 🔥 NEW: Clear link tracker
 app.post('/api/debug/clear-link-tracker', (req, res) => {
   const count = Object.keys(linkTracker).length;
   linkTracker = {};
   saveLinkTracker(linkTracker);
   
-  console.log(`[Debug] Cleared ${count} links from tracker`);
+  console.log(`[Debug] Cleared ${count} link+service combinations from tracker`);
   
   return res.json({
     success: true,
-    clearedLinks: count,
+    clearedLinkServices: count,
   });
 });
 
@@ -910,7 +954,7 @@ app.get('/api/health', (req, res) => {
     pendingRuns: allRuns.filter(r => !r.done && !r.cancelled && !r.paused).length,
     retryingRuns: allRuns.filter(r => !r.done && !r.cancelled && r.retryCount > 0).length,
     executingNow: executingRunIds.size,
-    activeLinks: Object.keys(linkTracker).length,
+    activeLinkServices: Object.keys(linkTracker).length,
   });
 });
 
@@ -924,7 +968,7 @@ app.listen(PORT, '0.0.0.0', () => {
   const pending = allRuns.filter(r => !r.done && !r.cancelled && !r.paused).length;
   const retrying = allRuns.filter(r => !r.done && r.retryCount > 0).length;
   console.log(`⏳ ${pending} runs pending, ${retrying} retrying`);
-  console.log(`🔗 ${Object.keys(linkTracker).length} active links tracked`);
+  console.log(`🔗 ${Object.keys(linkTracker).length} active link+service combinations tracked`);
 });
 
 /* =========================
