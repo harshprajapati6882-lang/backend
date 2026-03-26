@@ -45,7 +45,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   🔥 GENERATE SCHEDULER ORDER ID
+   GENERATE SCHEDULER ORDER ID
 ========================= */
 function generateSchedulerOrderId() {
   return `SCH-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -63,7 +63,7 @@ function addRuns(services, baseConfig, schedulerOrderId) {
     serviceConfig.runs.forEach((run) => {
       allRuns.push({
         id: Date.now() + Math.random(),
-        schedulerOrderId, // 🔥 NEW - Track which order this run belongs to
+        schedulerOrderId,
         label,
         apiUrl: baseConfig.apiUrl,
         apiKey: baseConfig.apiKey,
@@ -73,7 +73,7 @@ function addRuns(services, baseConfig, schedulerOrderId) {
         time: run.time,
         done: false,
         cancelled: false,
-        paused: false, // 🔥 NEW
+        paused: false,
         retryCount: 0,
         isExecuting: false,
       });
@@ -87,8 +87,18 @@ function addRuns(services, baseConfig, schedulerOrderId) {
    EXECUTE RUN (SAFE + RETRY)
 ========================= */
 async function executeRun(run) {
-  // 🔥 Check paused status
-  if (run.cancelled || run.done || run.isExecuting || run.paused) return;
+  // 🔥 CRITICAL FIX: Check cancellation FIRST
+  if (run.cancelled) {
+    if (!run.done) {
+      run.done = true;
+      console.log(`[SAFEGUARD] Cancelled run marked as done: ${run.label} (ID: ${run.id})`);
+      saveRuns(allRuns);
+    }
+    return;
+  }
+
+  // Skip if already done, executing, or paused
+  if (run.done || run.isExecuting || run.paused) return;
 
   run.isExecuting = true;
 
@@ -105,6 +115,10 @@ async function executeRun(run) {
     // 🔥 Check if cancelled during execution
     if (run.cancelled || run.paused) {
       console.log(`[${run.label}] Stopped (cancelled/paused)`);
+      if (run.cancelled) {
+        run.done = true;
+        saveRuns(allRuns);
+      }
       run.isExecuting = false;
       return;
     }
@@ -150,9 +164,18 @@ setInterval(async () => {
   const now = Date.now();
 
   for (let run of allRuns) {
-    // 🔥 Skip paused runs
-    if (run.done || run.cancelled || run.paused) continue;
+    // 🔥 FIX: Mark cancelled runs as done to stop re-checking
+    if (run.cancelled) {
+      if (!run.done) {
+        run.done = true;
+        console.log(`[CLEANUP] Marked cancelled run as done: ${run.label} (ID: ${run.id})`);
+      }
+      continue;
+    }
 
+    // Skip completed or paused runs
+    if (run.done || run.paused) continue;
+    
     const runTime = new Date(run.time).getTime();
 
     if (runTime <= now) {
@@ -174,7 +197,6 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  // 🔥 Generate unique scheduler order ID
   const schedulerOrderId = generateSchedulerOrderId();
 
   console.log(`Creating order with schedulerOrderId: ${schedulerOrderId}`);
@@ -184,7 +206,7 @@ app.post('/api/order', async (req, res) => {
   return res.json({
     success: true,
     message: 'Order scheduled successfully',
-    schedulerOrderId, // 🔥 Return this to frontend
+    schedulerOrderId,
   });
 });
 
@@ -195,6 +217,7 @@ app.post('/api/order/control', (req, res) => {
   const { schedulerOrderId, action } = req.body;
 
   console.log(`[Order Control] Received: ${action} for ${schedulerOrderId}`);
+  console.log(`[Order Control] Current allRuns count: ${allRuns.length}`);
 
   if (!schedulerOrderId || !action) {
     return res.status(400).json({ 
@@ -213,8 +236,13 @@ app.post('/api/order/control', (req, res) => {
   // Find all runs for this schedulerOrderId
   const orderRuns = allRuns.filter(run => run.schedulerOrderId === schedulerOrderId);
 
+  console.log(`[Order Control] Found ${orderRuns.length} runs for ${schedulerOrderId}`);
+
   if (orderRuns.length === 0) {
     console.warn(`[Order Control] No runs found for ${schedulerOrderId}`);
+    console.log(`[Order Control] Sample schedulerOrderIds in storage:`, 
+      [...new Set(allRuns.slice(0, 5).map(r => r.schedulerOrderId))]);
+    
     return res.status(404).json({ 
       success: false,
       error: 'Order not found' 
@@ -225,33 +253,44 @@ app.post('/api/order/control', (req, res) => {
 
   orderRuns.forEach(run => {
     if (action === 'cancel') {
-      // 🔥 Cancel all pending runs
-      if (!run.done) {
+      // 🔥 CRITICAL FIX: Mark as BOTH cancelled AND done
+      if (!run.cancelled || !run.done) {
+        const wasPending = !run.done && !run.cancelled;
+        
         run.cancelled = true;
+        run.done = true; // ✅ THIS IS THE KEY FIX
         run.paused = false;
-        affectedCount++;
+        run.isExecuting = false;
+        
+        if (wasPending) {
+          affectedCount++;
+          console.log(`[Order Control] ✅ Cancelled run: ${run.label} @ ${run.time} (ID: ${run.id})`);
+        }
       }
     } else if (action === 'pause') {
-      // 🔥 Pause all pending runs
       if (!run.done && !run.cancelled) {
         run.paused = true;
         affectedCount++;
+        console.log(`[Order Control] ⏸️ Paused run: ${run.label} (ID: ${run.id})`);
       }
     } else if (action === 'resume') {
-      // 🔥 Resume paused runs
       if (!run.done && !run.cancelled && run.paused) {
         run.paused = false;
         affectedCount++;
+        console.log(`[Order Control] ▶️ Resumed run: ${run.label} (ID: ${run.id})`);
       }
     }
   });
 
+  // 🔥 CRITICAL: Save immediately after modification
   saveRuns(allRuns);
+  console.log(`[Order Control] ✅ Saved ${allRuns.length} runs to disk`);
 
-  // 🔥 Calculate status and stats
-  const completedRuns = orderRuns.filter(r => r.done).length;
+  // Calculate final stats
+  const completedRuns = orderRuns.filter(r => r.done && !r.cancelled).length;
   const cancelledRuns = orderRuns.filter(r => r.cancelled).length;
-  const pausedRuns = orderRuns.filter(r => r.paused).length;
+  const pausedRuns = orderRuns.filter(r => r.paused && !r.done && !r.cancelled).length;
+  const pendingRuns = orderRuns.filter(r => !r.done && !r.cancelled && !r.paused).length;
   const totalRuns = orderRuns.length;
 
   let status = 'running';
@@ -259,19 +298,25 @@ app.post('/api/order/control', (req, res) => {
     status = 'cancelled';
   } else if (completedRuns === totalRuns) {
     status = 'completed';
-  } else if (pausedRuns > 0 && pausedRuns + completedRuns + cancelledRuns === totalRuns) {
+  } else if (pausedRuns > 0 && pendingRuns === 0) {
     status = 'paused';
   }
 
-  // 🔥 Generate runStatuses array
   const runStatuses = orderRuns.map(run => {
-    if (run.done) return 'completed';
     if (run.cancelled) return 'cancelled';
+    if (run.done) return 'completed';
     return 'pending';
   });
 
-  console.log(`[Order Control] ${action.toUpperCase()} completed: ${affectedCount} runs affected`);
-  console.log(`[Order Control] Status: ${status}, Completed: ${completedRuns}/${totalRuns}`);
+  console.log(`[Order Control] ✅ ${action.toUpperCase()} completed:`, {
+    affectedRuns: affectedCount,
+    status,
+    completedRuns,
+    cancelledRuns,
+    pausedRuns,
+    pendingRuns,
+    totalRuns
+  });
 
   return res.json({
     success: true,
@@ -284,7 +329,7 @@ app.post('/api/order/control', (req, res) => {
 });
 
 /* =========================
-   🔥 LEGACY CANCEL ENDPOINT (Keep for backward compatibility)
+   LEGACY CANCEL ENDPOINT (Keep for backward compatibility)
 ========================= */
 app.post('/api/cancel', (req, res) => {
   const { link } = req.body;
@@ -298,6 +343,7 @@ app.post('/api/cancel', (req, res) => {
   allRuns.forEach(run => {
     if (run.link === link && !run.done) {
       run.cancelled = true;
+      run.done = true; // 🔥 FIX: Mark as done
       cancelledCount++;
     }
   });
@@ -313,7 +359,7 @@ app.post('/api/cancel', (req, res) => {
 });
 
 /* =========================
-   🔥 GET ORDER STATUS (Optional - for debugging)
+   GET ORDER STATUS
 ========================= */
 app.get('/api/order/status/:schedulerOrderId', (req, res) => {
   const { schedulerOrderId } = req.params;
