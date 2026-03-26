@@ -10,42 +10,38 @@ app.use(cors());
 app.use(express.json());
 
 const DATA_FILE = 'runs.json';
+const LINK_TRACKER_FILE = 'link_tracker.json';
 
-// 🔥 Retry configuration
-const RETRY_DELAY_MINUTES = 5; // Retry every 5 minutes
-const MAX_RETRY_HOURS = 2; // Max 2 hours from original time
+// 🔥 Configuration
+const RETRY_DELAY_MINUTES = 5;
+const MAX_RETRY_HOURS = 3;
+const STATUS_CACHE_MINUTES = 3;
 
-// 🔥 Error patterns that indicate "order in progress" (add more as needed)
-const CONFLICT_ERROR_PATTERNS = [
-  'order already in progress',
-  'order in progress',
-  'already processing',
-  'pending order',
-  'duplicate order',
-  'please wait',
-  'too many orders',
-  'rate limit',
-  'try again later',
-  'order exists',
-  'already exists',
-  'in queue',
+// 🔥 Active SMM orders tracker per link
+let linkTracker = {};
+
+// Status values that mean "order is still active"
+const ACTIVE_ORDER_STATUSES = [
+  'pending',
+  'in progress',
   'processing',
+  'partial',
+  'inprogress',
 ];
 
 /* =========================
-   LOAD + SAVE RUNS
+   LOAD + SAVE
 ========================= */
 function loadRuns() {
   if (!fs.existsSync(DATA_FILE)) return [];
   try {
     const data = JSON.parse(fs.readFileSync(DATA_FILE));
-    // Reset isExecuting on load (in case server crashed mid-execution)
     return data.map(run => ({
       ...run,
       isExecuting: false
     }));
   } catch (err) {
-    console.error('[Load Runs] Error parsing runs.json:', err.message);
+    console.error('[Load Runs] Error:', err.message);
     return [];
   }
 }
@@ -54,23 +50,140 @@ function saveRuns(runs) {
   try {
     fs.writeFileSync(DATA_FILE, JSON.stringify(runs, null, 2));
   } catch (err) {
-    console.error('[Save Runs] Error saving runs.json:', err.message);
+    console.error('[Save Runs] Error:', err.message);
+  }
+}
+
+function loadLinkTracker() {
+  if (!fs.existsSync(LINK_TRACKER_FILE)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(LINK_TRACKER_FILE));
+  } catch (err) {
+    console.error('[Load Link Tracker] Error:', err.message);
+    return {};
+  }
+}
+
+function saveLinkTracker(tracker) {
+  try {
+    fs.writeFileSync(LINK_TRACKER_FILE, JSON.stringify(tracker, null, 2));
+  } catch (err) {
+    console.error('[Save Link Tracker] Error:', err.message);
   }
 }
 
 let allRuns = loadRuns();
-console.log(`[Startup] Loaded ${allRuns.length} runs from storage`);
+linkTracker = loadLinkTracker();
 
-// Track runs currently being executed to prevent duplicates
+console.log(`[Startup] Loaded ${allRuns.length} runs`);
+console.log(`[Startup] Tracking ${Object.keys(linkTracker).length} active links`);
+
 const executingRunIds = new Set();
 
 /* =========================
-   CHECK IF ERROR IS CONFLICT
+   CHECK ORDER STATUS (SMM PANEL API)
 ========================= */
-function isConflictError(errorMessage) {
-  if (!errorMessage) return false;
-  const lowerError = String(errorMessage).toLowerCase();
-  return CONFLICT_ERROR_PATTERNS.some(pattern => lowerError.includes(pattern));
+async function checkOrderStatus(apiUrl, apiKey, smmOrderId) {
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      action: 'status',
+      order: String(smmOrderId),
+    });
+
+    const response = await axios.post(apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
+    });
+
+    // Response format: { "charge": "...", "status": "Partial", "remains": "..." }
+    const data = response.data;
+    
+    if (data && data.status) {
+      return {
+        status: String(data.status).toLowerCase(),
+        remains: data.remains || 0,
+        charge: data.charge || 0,
+      };
+    }
+
+    return null;
+  } catch (err) {
+    console.error(`[Check Status] Error for order ${smmOrderId}:`, err.message);
+    return null;
+  }
+}
+
+/* =========================
+   CHECK IF LINK HAS ACTIVE ORDER
+========================= */
+async function hasActiveSmmOrder(link, apiUrl, apiKey) {
+  const tracker = linkTracker[link];
+  
+  if (!tracker || !tracker.smmOrderId) {
+    return false;
+  }
+
+  // Check cache age
+  const cacheAge = Date.now() - new Date(tracker.lastChecked).getTime();
+  const cacheExpired = cacheAge > (STATUS_CACHE_MINUTES * 60 * 1000);
+
+  // If cache is fresh and status was active, assume still active
+  if (!cacheExpired && tracker.isActive) {
+    console.log(`[Link Check] ${link} - Using cached status (active)`);
+    return true;
+  }
+
+  // Cache expired or was inactive - check again
+  console.log(`[Link Check] ${link} - Checking SMM order ${tracker.smmOrderId}...`);
+  
+  const statusResult = await checkOrderStatus(apiUrl, apiKey, tracker.smmOrderId);
+
+  if (!statusResult) {
+    // API failed - assume inactive to avoid blocking
+    console.warn(`[Link Check] ${link} - Status check failed, assuming inactive`);
+    tracker.isActive = false;
+    tracker.lastChecked = new Date().toISOString();
+    saveLinkTracker(linkTracker);
+    return false;
+  }
+
+  const isActive = ACTIVE_ORDER_STATUSES.includes(statusResult.status);
+
+  // Update tracker
+  tracker.status = statusResult.status;
+  tracker.isActive = isActive;
+  tracker.lastChecked = new Date().toISOString();
+  tracker.remains = statusResult.remains;
+
+  console.log(`[Link Check] ${link} - Status: ${statusResult.status}, Active: ${isActive}, Remains: ${statusResult.remains}`);
+
+  // If order completed, remove from tracker
+  if (!isActive) {
+    console.log(`[Link Check] ${link} - Order completed, removing from tracker`);
+    delete linkTracker[link];
+  }
+
+  saveLinkTracker(linkTracker);
+
+  return isActive;
+}
+
+/* =========================
+   REGISTER SMM ORDER FOR LINK
+========================= */
+function registerSmmOrder(link, smmOrderId, apiUrl) {
+  linkTracker[link] = {
+    smmOrderId,
+    apiUrl,
+    createdAt: new Date().toISOString(),
+    lastChecked: new Date().toISOString(),
+    isActive: true,
+    status: 'pending',
+    remains: 0,
+  };
+  saveLinkTracker(linkTracker);
+  console.log(`[Link Tracker] Registered order ${smmOrderId} for ${link}`);
 }
 
 /* =========================
@@ -84,7 +197,7 @@ function isRunTimedOut(run) {
 }
 
 /* =========================
-   PLACE ORDER (API CALL)
+   PLACE ORDER (SMM PANEL API)
 ========================= */
 async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
   const params = new URLSearchParams({
@@ -130,19 +243,15 @@ function addRuns(services, baseConfig, schedulerOrderId) {
         service: serviceConfig.serviceId,
         link: baseConfig.link,
         quantity: run.quantity,
-        // 🔥 Time tracking
-        originalTime: runTime, // Never changes
-        time: runTime, // Current scheduled time (may be rescheduled)
-        // Status flags
+        originalTime: runTime,
+        time: runTime,
         done: false,
         cancelled: false,
         paused: false,
         isExecuting: false,
-        // 🔥 Retry tracking
         retryCount: 0,
         retryReason: null,
         lastError: null,
-        // Execution tracking
         executedAt: null,
         smmOrderId: null,
         createdAt: new Date().toISOString(),
@@ -156,45 +265,26 @@ function addRuns(services, baseConfig, schedulerOrderId) {
 /* =========================
    HANDLE RETRY / RESCHEDULE
 ========================= */
-function handleRunRetry(run, errorMessage) {
-  const isConflict = isConflictError(errorMessage);
+function handleRunRetry(run, errorMessage, reason = 'API Error') {
   const isTimedOut = isRunTimedOut(run);
 
   run.lastError = errorMessage;
 
-  // Check if we've exceeded max retry time
   if (isTimedOut) {
-    console.log(`[${run.label}] ⏰ TIMEOUT - Exceeded ${MAX_RETRY_HOURS} hours from original time`);
+    console.log(`[${run.label}] ⏰ TIMEOUT - Exceeded ${MAX_RETRY_HOURS} hours`);
     run.done = true;
     run.retryReason = `Timeout: Exceeded ${MAX_RETRY_HOURS}h retry limit`;
     return;
   }
 
-  if (isConflict) {
-    // 🔥 CONFLICT ERROR: Reschedule without counting as failure
-    run.retryCount++;
-    run.retryReason = 'Order in progress - waiting for previous order to complete';
-    
-    // Reschedule for RETRY_DELAY_MINUTES later
-    const newTime = new Date(Date.now() + RETRY_DELAY_MINUTES * 60 * 1000).toISOString();
-    run.time = newTime;
-    
-    console.log(`[${run.label}] 🔄 CONFLICT - Rescheduled to ${newTime} (Retry #${run.retryCount})`);
-  } else {
-    // 🔥 OTHER ERROR: Count as failure, max 3 retries
-    run.retryCount++;
-    run.retryReason = `API Error: ${errorMessage}`;
-    
-    if (run.retryCount >= 3) {
-      console.log(`[${run.label}] ❌ FAILED - Max retries (3) reached`);
-      run.done = true;
-    } else {
-      // Reschedule for 2 minutes later (shorter for non-conflict errors)
-      const newTime = new Date(Date.now() + 2 * 60 * 1000).toISOString();
-      run.time = newTime;
-      console.log(`[${run.label}] 🔄 ERROR - Retry ${run.retryCount}/3 scheduled for ${newTime}`);
-    }
-  }
+  run.retryCount++;
+  run.retryReason = reason;
+
+  // Reschedule for RETRY_DELAY_MINUTES later
+  const newTime = new Date(Date.now() + RETRY_DELAY_MINUTES * 60 * 1000).toISOString();
+  run.time = newTime;
+
+  console.log(`[${run.label}] 🔄 ${reason} - Retry #${run.retryCount} at ${newTime}`);
 }
 
 /* =========================
@@ -203,12 +293,10 @@ function handleRunRetry(run, errorMessage) {
 async function executeRun(run) {
   const runId = run.id;
 
-  // Check if already being executed
   if (executingRunIds.has(runId)) {
     return;
   }
 
-  // Check cancelled/done/paused
   if (run.cancelled) {
     run.done = true;
     return;
@@ -218,11 +306,23 @@ async function executeRun(run) {
     return;
   }
 
-  // Check timeout before executing
   if (isRunTimedOut(run)) {
     run.done = true;
     run.retryReason = `Timeout: Exceeded ${MAX_RETRY_HOURS}h retry limit`;
     console.log(`[${run.label}] ⏰ TIMEOUT before execution`);
+    return;
+  }
+
+  // 🔥 CHECK IF LINK HAS ACTIVE ORDER
+  const linkHasActiveOrder = await hasActiveSmmOrder(run.link, run.apiUrl, run.apiKey);
+
+  if (linkHasActiveOrder) {
+    console.log(`[${run.label}] 🔒 Link has active order - rescheduling...`);
+    handleRunRetry(
+      run,
+      'Link has active SMM order',
+      'Waiting for previous order to complete'
+    );
     return;
   }
 
@@ -232,16 +332,15 @@ async function executeRun(run) {
 
   try {
     if (!run.quantity || run.quantity <= 0) {
-      console.log(`[${run.label}] Skipping - invalid quantity: ${run.quantity}`);
+      console.log(`[${run.label}] Skipping - invalid quantity`);
       run.done = true;
       return;
     }
 
-    console.log(`[${run.label}] ▶️ Executing: ${run.quantity} to ${run.link.slice(-20)} (Retry: ${run.retryCount})`);
+    console.log(`[${run.label}] ▶️ Executing: ${run.quantity} to ${run.link.slice(-30)} (Retry: ${run.retryCount})`);
 
     const result = await placeOrder(run);
 
-    // Check if cancelled during execution
     if (run.cancelled) {
       console.log(`[${run.label}] Cancelled during execution`);
       run.done = true;
@@ -249,29 +348,32 @@ async function executeRun(run) {
     }
 
     if (result?.order) {
-      // 🔥 SUCCESS
-      console.log(`[${run.label}] ✅ SUCCESS - SMM Order ID: ${result.order}`);
+      // 🔥 SUCCESS - Register SMM order for this link
+      const smmOrderId = String(result.order);
+      console.log(`[${run.label}] ✅ SUCCESS - SMM Order: ${smmOrderId}`);
+      
       run.done = true;
       run.executedAt = new Date().toISOString();
-      run.smmOrderId = result.order;
+      run.smmOrderId = smmOrderId;
       run.lastError = null;
       run.retryReason = null;
+
+      // 🔥 Register this order for the link
+      registerSmmOrder(run.link, smmOrderId, run.apiUrl);
+
     } else if (result?.error) {
-      // 🔥 API returned error
       console.error(`[${run.label}] ❌ API Error:`, result.error);
-      handleRunRetry(run, result.error);
+      handleRunRetry(run, result.error, 'SMM Panel Error');
     } else {
-      // 🔥 Unknown response
       console.error(`[${run.label}] ❌ Unknown response:`, JSON.stringify(result));
-      handleRunRetry(run, 'Unknown API response');
+      handleRunRetry(run, 'Unknown API response', 'Invalid Response');
     }
 
   } catch (err) {
     const errorMsg = err.response?.data?.error || err.response?.data?.message || err.message || 'Unknown error';
     console.error(`[${run.label}] ❌ EXCEPTION:`, errorMsg);
-    handleRunRetry(run, errorMsg);
+    handleRunRetry(run, errorMsg, 'Network/API Error');
   } finally {
-    // Always clean up
     run.isExecuting = false;
     executingRunIds.delete(runId);
     saveRuns(allRuns);
@@ -293,15 +395,12 @@ async function runScheduler() {
   const pendingRuns = [];
 
   try {
-    // Collect all runs that need to execute
     for (const run of allRuns) {
-      // Clean up cancelled runs
       if (run.cancelled && !run.done) {
         run.done = true;
         continue;
       }
 
-      // Skip if not eligible
       if (run.done || run.cancelled || run.paused || run.isExecuting) {
         continue;
       }
@@ -317,8 +416,7 @@ async function runScheduler() {
       }
     }
 
-    // Execute runs in parallel with concurrency limit
-    const CONCURRENCY_LIMIT = 5;
+    const CONCURRENCY_LIMIT = 3; // Process 3 runs at a time
     
     if (pendingRuns.length > 0) {
       console.log(`[Scheduler] Processing ${pendingRuns.length} pending runs...`);
@@ -334,7 +432,6 @@ async function runScheduler() {
 
     saveRuns(allRuns);
 
-    // Log stats occasionally
     if (pendingRuns.length > 0 || Math.random() < 0.05) {
       const stats = {
         total: allRuns.length,
@@ -342,6 +439,7 @@ async function runScheduler() {
         retrying: allRuns.filter(r => !r.done && !r.cancelled && r.retryCount > 0).length,
         done: allRuns.filter(r => r.done && !r.cancelled).length,
         cancelled: allRuns.filter(r => r.cancelled).length,
+        activeLinks: Object.keys(linkTracker).length,
       };
       console.log(`[Scheduler] Stats:`, stats);
     }
@@ -353,10 +451,7 @@ async function runScheduler() {
   }
 }
 
-// Run scheduler every 10 seconds
 setInterval(runScheduler, 10000);
-
-// Run immediately on startup
 setTimeout(runScheduler, 3000);
 
 /* =========================
@@ -476,7 +571,7 @@ app.post('/api/order/control', (req, res) => {
 });
 
 /* =========================
-   🔥 GET ORDER RUNS (for frontend sync)
+   GET ORDER RUNS
 ========================= */
 app.get('/api/order/runs/:schedulerOrderId', (req, res) => {
   const { schedulerOrderId } = req.params;
@@ -509,7 +604,7 @@ app.get('/api/order/runs/:schedulerOrderId', (req, res) => {
 });
 
 /* =========================
-   LEGACY CANCEL ENDPOINT
+   LEGACY CANCEL
 ========================= */
 app.post('/api/cancel', (req, res) => {
   const { link } = req.body;
@@ -587,7 +682,7 @@ app.get('/api/order/status/:schedulerOrderId', (req, res) => {
 });
 
 /* =========================
-   DEBUG: View All Runs
+   DEBUG ENDPOINTS
 ========================= */
 app.get('/api/debug/runs', (req, res) => {
   const stats = {
@@ -609,6 +704,7 @@ app.get('/api/debug/runs', (req, res) => {
       id: r.id,
       schedulerOrderId: r.schedulerOrderId,
       label: r.label,
+      link: r.link.slice(-30),
       quantity: r.quantity,
       originalTime: r.originalTime,
       currentTime: r.time,
@@ -622,12 +718,23 @@ app.get('/api/debug/runs', (req, res) => {
     stats,
     pendingRuns,
     executingIds: Array.from(executingRunIds),
+    activeLinks: Object.keys(linkTracker).map(link => ({
+      link: link.slice(-30),
+      ...linkTracker[link],
+    })),
   });
 });
 
-/* =========================
-   DEBUG: Force Retry Stuck Runs
-========================= */
+app.get('/api/debug/link-tracker', (req, res) => {
+  return res.json({
+    activeLinks: Object.keys(linkTracker).length,
+    links: Object.keys(linkTracker).map(link => ({
+      link: link.slice(-40),
+      ...linkTracker[link],
+    })),
+  });
+});
+
 app.post('/api/debug/retry-stuck', (req, res) => {
   let fixedCount = 0;
 
@@ -645,7 +752,6 @@ app.post('/api/debug/retry-stuck', (req, res) => {
       run.time = new Date().toISOString();
       run.isExecuting = false;
       fixedCount++;
-      console.log(`[Debug] Rescheduled stuck run: ${run.id}`);
     }
   });
 
@@ -697,6 +803,7 @@ app.get('/api/health', (req, res) => {
     pendingRuns: allRuns.filter(r => !r.done && !r.cancelled && !r.paused).length,
     retryingRuns: allRuns.filter(r => !r.done && !r.cancelled && r.retryCount > 0).length,
     executingNow: executingRunIds.size,
+    activeLinks: Object.keys(linkTracker).length,
   });
 });
 
@@ -710,6 +817,7 @@ app.listen(PORT, '0.0.0.0', () => {
   const pending = allRuns.filter(r => !r.done && !r.cancelled && !r.paused).length;
   const retrying = allRuns.filter(r => !r.done && r.retryCount > 0).length;
   console.log(`⏳ ${pending} runs pending, ${retrying} retrying`);
+  console.log(`🔗 ${Object.keys(linkTracker).length} active links tracked`);
 });
 
 /* =========================
